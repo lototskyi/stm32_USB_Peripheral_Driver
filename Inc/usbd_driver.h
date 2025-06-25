@@ -9,6 +9,7 @@
 #define USBD_DRIVER_H_
 
 #include "stm32f4xx.h"
+#include "usb_standards.h"
 
 #define USB_OTG_HS_GLOBAL  ((USB_OTG_GlobalTypeDef *)(USB_OTG_HS_PERIPH_BASE + USB_OTG_GLOBAL_BASE))
 #define USB_OTG_HS_DEVICE  ((USB_OTG_DeviceTypeDef *)(USB_OTG_HS_PERIPH_BASE + USB_OTG_DEVICE_BASE))
@@ -17,12 +18,22 @@
 // Total count of IN or OUT endpoints
 #define ENDPOINT_COUNT	6
 
-void initialize_gpio_pins();
-void initialize_core();
-void connect();
-void disconnect();
-static void configure_rxfifo_size(uint16_t size);
-static void configure_txfifo_size(uint8_t endpoint_number, uint16_t size);
+/// \brief USB driver functions exposed to USB framework
+typedef struct
+{
+	void (*initialize_core)();
+	void (*initialize_gpio_pins)();
+	void (*connect)();
+	void (*disconnect)();
+	void (*flush_rxfifo)();
+	void (*flush_txfifo)(uint8_t endpoint_number);
+	void (*configure_in_endpoint)(uint8_t endpoint_number, UsbEndpointType endpoint_type, uint16_t endpoint_size);
+	void (*read_packet)(void *buffer, uint16_t size);
+	void (*write_packet)(uint8_t endpoint_number, void const *buffer, uint16_t size);
+	// TODO: Add pointers to the other driver functions
+} UsbDriver;
+
+extern const UsbDriver usb_driver;
 
 /**
  * @brief Return the structure contains the registers of a specific IN endpoint

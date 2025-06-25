@@ -6,8 +6,9 @@
  */
 
 #include "usbd_driver.h"
+#include "Helpers/logger.h"
 
-void initialize_gpio_pins()
+static void initialize_gpio_pins()
 {
 	// Enable the clock for GPIOB
 	SET_BIT(RCC->AHB1ENR, RCC_AHB1ENR_GPIOBEN);
@@ -25,7 +26,7 @@ void initialize_gpio_pins()
 	);
 }
 
-void initialize_core()
+static void initialize_core()
 {
 	// Enable the clock for USB core
 	SET_BIT(RCC->AHB1ENR, RCC_AHB1ENR_OTGHSEN);
@@ -66,7 +67,7 @@ void initialize_core()
 /**
  * Connect the USB device to the bus
  */
-void connect()
+static void connect()
 {
 	// Power the transceiver on
 	SET_BIT(USB_OTG_HS->GCCFG, USB_OTG_GCCFG_PWRDWN);
@@ -78,13 +79,147 @@ void connect()
 /**
  * Disconnect the USB device from the bus
  */
-void disconnect()
+static void disconnect()
 {
 	// Disconnect the device from the bus
 	SET_BIT(USB_OTG_HS_DEVICE->DCTL, USB_OTG_DCTL_SDIS);
 
 	// Power the transceiver off
 	CLEAR_BIT(USB_OTG_HS->GCCFG, USB_OTG_GCCFG_PWRDWN);
+}
+
+/**
+ * @brief Pop data from the RxFIFO and store it in the buffer
+ * @param buffer Pointer to the buffer, in which the popped data will be stored
+ * @param size Count of bytes to be popped from the dedicated RxFIFO memory
+ */
+static void read_packet(void *buffer, uint16_t size)
+{
+	// Note: There is only one RxFIFO
+	__IO uint32_t *fifo = FIFO(0);
+
+	for (; size >= 4; size -= 4, buffer += 4)
+	{
+		// Pop one 32-bit word of data (until there is less than one word remaining)
+		uint32_t data = *fifo;
+		// Store the data in the buffer
+		*((uint32_t*)buffer) = data;
+	}
+
+	if (size > 0)
+	{
+		// Pop the last remaining bytes (which are less than one word)
+		uint32_t data = *fifo;
+
+		for (; size > 0; size--, buffer++, data >>= 8)
+		{
+			// Store the data in the buffer with the correct alignment
+			*((uint8_t*)buffer) = 0xFF & data;
+		}
+	}
+}
+
+
+/**
+ * @brief Push a packet into the TxFIFO on an IN endpoint
+ * @param endpoint_number The number of the endpoint, to which the data will be written
+ * @param buffer Pointer to the buffer contains the data to be written to the endpoint
+ * @param size The size of data to be written in bytes
+ */
+static void write_packet(uint8_t endpoint_number, void const *buffer, uint16_t size)
+{
+	__IO uint32_t *fifo = FIFO(endpoint_number);
+	USB_OTG_INEndpointTypeDef *in_endpoint = IN_ENDPOINT(endpoint_number);
+
+	// Configure the transmission (1 packet that has `size` bytes)
+	MODIFY_REG(in_endpoint->DIEPTSIZ,
+		USB_OTG_DIEPTSIZ_PKTCNT | USB_OTG_DIEPTSIZ_XFRSIZ,
+		_VAL2FLD(USB_OTG_DIEPTSIZ_PKTCNT, 1) | _VAL2FLD(USB_OTG_DIEPTSIZ_XFRSIZ, size)
+	);
+
+	// Enable the transmission after clearing both STALL and NAK of the endpoint
+	MODIFY_REG(in_endpoint->DIEPCTL,
+		USB_OTG_DIEPCTL_STALL,
+		USB_OTG_DIEPCTL_CNAK | USB_OTG_DIEPCTL_EPENA
+	);
+
+	// Get the size in term of 32-bit words (to avoid integer overflow in the loop)
+	size = (size + 3) / 4;
+
+	for (; size > 0; size--, buffer += 4)
+	{
+		// Push the data to the TxFIFO
+		*fifo = *((uint32_t*)buffer);
+	}
+}
+
+/**
+ * @brief Update the start addresses of all FIFOs according to the size of each FIFO
+ */
+static void refresh_fifo_start_addresses()
+{
+	// The first changeable start address begins after the region of RxFIFO
+	uint16_t start_address = _FLD2VAL(USB_OTG_GRXFSIZ_RXFD, USB_OTG_HS->GRXFSIZ) * 4;
+
+	// Update the start address of the FIFO0
+	MODIFY_REG(USB_OTG_HS->DIEPTXF0_HNPTXFSIZ,
+		USB_OTG_TX0FSA,
+		_VAL2FLD(USB_OTG_TX0FSA, start_address)
+	);
+
+	// The next start address is after where the last TxFIFO ends
+	start_address += _FLD2VAL(USB_OTG_TX0FD, USB_OTG_HS->DIEPTXF0_HNPTXFSIZ) * 4;
+
+	// Update the start addresses of the rest TxFOFOs
+	for (uint8_t txfifo_number = 0; txfifo_number < ENDPOINT_COUNT - 1; txfifo_number++) {
+		MODIFY_REG(USB_OTG_HS->DIEPTXF[txfifo_number],
+			USB_OTG_NPTXFSA,
+			_VAL2FLD(USB_OTG_NPTXFSA, start_address)
+		);
+
+		start_address += _FLD2VAL(USB_OTG_NPTXFD, USB_OTG_HS->DIEPTXF[txfifo_number]) * 4;
+	}
+}
+
+/*
+ * @brief Configure the RxFIFO of OUT endpoints
+ * @param size The size of the largest OUT endpoint in bytes
+ * @note The RxFIFO is shared between all OUT endpoints
+ */
+static void configure_rxfifo_size(uint16_t size)
+{
+	// Consider the space required to save status packets in RxFIFO and get the size in term of 32-bit words
+	size = 10 + (2 * ((size / 4) + 1));
+
+	// Configure the depth of the FIFO
+	MODIFY_REG(USB_OTG_HS->GRXFSIZ,
+		USB_OTG_GRXFSIZ_RXFD,
+		_VAL2FLD(USB_OTG_GRXFSIZ_RXFD, size)
+	);
+
+	refresh_fifo_start_addresses();
+}
+
+/**
+ * @brief Configure the TxFIFO of an IN endpoint
+ * @param endpoint_number The number of the IN endpoint we want to configure its TxFIFO
+ * @param size The size of the IN endpoint in bytes
+ * @note Any change on any FIFO will update the registers of all TxFIFO to adapt start offsets
+ */
+static void configure_txfifo_size(uint8_t endpoint_number, uint16_t size)
+{
+	// Get the FIFO size in term of 32-bit words
+	size = (size + 3) / 4;
+
+	// Configure the depth of the TxFIFO
+	if (endpoint_number == 0) {
+		MODIFY_REG(USB_OTG_HS->DIEPTXF0_HNPTXFSIZ,
+			USB_OTG_TX0FD,
+			_VAL2FLD(USB_OTG_TX0FD, size)
+		);
+	}
+
+	refresh_fifo_start_addresses();
 }
 
 /**
@@ -185,75 +320,6 @@ static void deconfigure_endpoint(uint8_t endpoint_number)
 	flush_rxfifo();
 }
 
-/**
- * @brief Update the start addresses of all FIFOs according to the size of each FIFO
- */
-static void refresh_fifo_start_addresses()
-{
-	// The first changeable start address begins after the region of RxFIFO
-	uint16_t start_address = _FLD2VAL(USB_OTG_GRXFSIZ_RXFD, USB_OTG_HS->GRXFSIZ) * 4;
-
-	// Update the start address of the FIFO0
-	MODIFY_REG(USB_OTG_HS->DIEPTXF0_HNPTXFSIZ,
-		USB_OTG_TX0FSA,
-		_VAL2FLD(USB_OTG_TX0FSA, start_address)
-	);
-
-	// The next start address is after where the last TxFIFO ends
-	start_address += _FLD2VAL(USB_OTG_TX0FD, USB_OTG_HS->DIEPTXF0_HNPTXFSIZ) * 4;
-
-	// Update the start addresses of the rest TxFOFOs
-	for (uint8_t txfifo_number = 0; txfifo_number < ENDPOINT_COUNT - 1; txfifo_number++) {
-		MODIFY_REG(USB_OTG_HS->DIEPTXF[txfifo_number],
-			USB_OTG_NPTXFSA,
-			_VAL2FLD(USB_OTG_NPTXFSA, start_address)
-		);
-
-		start_address += _FLD2VAL(USB_OTG_NPTXFD, USB_OTG_HS->DIEPTXF[txfifo_number]) * 4;
-	}
-}
-
-/*
- * @brief Configure the RxFIFO of OUT endpoints
- * @param size The size of the largest OUT endpoint in bytes
- * @note The RxFIFO is shared between all OUT endpoints
- */
-static void configure_rxfifo_size(uint16_t size)
-{
-	// Consider the space required to save status packets in RxFIFO and get the size in term of 32-bit words
-	size = 10 + (2 * ((size / 4) + 1));
-
-	// Configure the depth of the FIFO
-	MODIFY_REG(USB_OTG_HS->GRXFSIZ,
-		USB_OTG_GRXFSIZ_RXFD,
-		_VAL2FLD(USB_OTG_GRXFSIZ_RXFD, size)
-	);
-
-	refresh_fifo_start_addresses();
-}
-
-/**
- * @brief Configure the TxFIFO of an IN endpoint
- * @param endpoint_number The number of the IN endpoint we want to configure its TxFIFO
- * @param size The size of the IN endpoint in bytes
- * @note Any change on any FIFO will update the registers of all TxFIFO to adapt start offsets
- */
-static void configure_txfifo_size(uint8_t endpoint_number, uint16_t size)
-{
-	// Get the FIFO size in term of 32-bit words
-	size = (size + 3) / 4;
-
-	// Configure the depth of the TxFIFO
-	if (endpoint_number == 0) {
-		MODIFY_REG(USB_OTG_HS->DIEPTXF0_HNPTXFSIZ,
-			USB_OTG_TX0FD,
-			_VAL2FLD(USB_OTG_TX0FD, size)
-		);
-	}
-
-	refresh_fifo_start_addresses();
-}
-
 static void usbrst_handler()
 {
 	log_info("USB reset signal was detected");
@@ -286,17 +352,30 @@ static void rxflvl_handler()
 		case 0x06: // SETUP packet (includes data)
 			//TODO
 			break;
-		case 0x02:
+		case 0x02: // OUT packet (includes data)
 			//TODO
-			break; // OUT packet (includes data)
+			break;
+		case 0x04: // SETUP stage has completed
 
+			// Re-enable the transmission on the endpoint
+			SET_BIT(OUT_ENDPOINT(endpoint_number)->DOEPCTL,
+				USB_OTG_DOEPCTL_CNAK | USB_OTG_DOEPCTL_EPENA
+			);
+			break;
+		case 0x03: // OUT transfer has completed
+
+			// Re-enable the transmission on the endpoint
+			SET_BIT(OUT_ENDPOINT(endpoint_number)->DOEPCTL,
+				USB_OTG_DOEPCTL_CNAK | USB_OTG_DOEPCTL_EPENA
+			);
+			break;
 	}
 }
 
 /**
  * Handle the USB core interrupts
  */
-void gintsts_handler()
+static void gintsts_handler()
 {
 	volatile uint32_t gintsts = USB_OTG_HS_GLOBAL->GINTSTS;
 
@@ -317,3 +396,14 @@ void gintsts_handler()
 	}
 }
 
+const UsbDriver usb_driver = {
+	.initialize_core = &initialize_core,
+	.initialize_gpio_pins = &initialize_gpio_pins,
+	.connect = &connect,
+	.disconnect = &disconnect,
+	.flush_rxfifo = &flush_rxfifo,
+	.flush_txfifo = &flush_txfifo,
+	.configure_in_endpoint = &configure_in_endpoint,
+	.read_packet = &read_packet,
+	.write_packet = &write_packet
+};
