@@ -7,6 +7,7 @@
 
 #include "usbd_driver.h"
 #include "Helpers/logger.h"
+#include <strings.h>
 
 static void initialize_gpio_pins()
 {
@@ -16,7 +17,7 @@ static void initialize_gpio_pins()
 	// Set alternate function 12 for: PB14 (-), and PB15 (+)
 	MODIFY_REG(GPIOB->AFR[1],
 		GPIO_AFRH_AFSEL14 | GPIO_AFRH_AFSEL15,
-		_VAL2FLD(GPIO_AFRH_AFSEL14, 0xC) | _VAL2FLD(GPIO_AFRH_AFSEL14, 0xC)
+		_VAL2FLD(GPIO_AFRH_AFSEL14, 0xC) | _VAL2FLD(GPIO_AFRH_AFSEL15, 0xC)
 	);
 
 	// Configure USB pins (in GPIOB) to work in alternate function mode
@@ -64,6 +65,15 @@ static void initialize_core()
 	SET_BIT(USB_OTG_HS_DEVICE->DIEPMSK, USB_OTG_DIEPMSK_XFRCM);
 }
 
+static void set_device_address(uint8_t address)
+{
+	MODIFY_REG(
+		USB_OTG_HS_DEVICE->DCFG,
+		USB_OTG_DCFG_DAD,
+		_VAL2FLD(USB_OTG_DCFG_DAD, address)
+	);
+}
+
 /**
  * Connect the USB device to the bus
  */
@@ -93,7 +103,7 @@ static void disconnect()
  * @param buffer Pointer to the buffer, in which the popped data will be stored
  * @param size Count of bytes to be popped from the dedicated RxFIFO memory
  */
-static void read_packet(void *buffer, uint16_t size)
+static void read_packet(void const *buffer, uint16_t size)
 {
 	// Note: There is only one RxFIFO
 	__IO uint32_t *fifo = FIFO(0);
@@ -327,6 +337,8 @@ static void usbrst_handler()
 	for (uint8_t i = 0; i <= ENDPOINT_COUNT; i++) {
 		deconfigure_endpoint(i);
 	}
+
+	usb_events.on_usb_reset_received();
 }
 
 static void enumdne_handler()
@@ -350,7 +362,7 @@ static void rxflvl_handler()
 	switch (pktsts)
 	{
 		case 0x06: // SETUP packet (includes data)
-			//TODO
+			usb_events.on_setup_data_received(endpoint_number, bcnt);
 			break;
 		case 0x02: // OUT packet (includes data)
 			//TODO
@@ -372,8 +384,34 @@ static void rxflvl_handler()
 	}
 }
 
+/** \brief Handle the interrupt raised when an IN endpoint has a rised interrupt
+ */
+static void iepint_handler()
+{
+	// Find the endpoint caused the interrupt
+	uint8_t endpoint_number = ffs(USB_OTG_HS_DEVICE->DAINT) - 1;
+
+	if (IN_ENDPOINT(endpoint_number)->DIEPINT & USB_OTG_DIEPINT_XFRC) {
+		usb_events.on_in_transfer_completed(endpoint_number);
+		// Clear the interrupt flag
+		SET_BIT(IN_ENDPOINT(endpoint_number)->DIEPINT, USB_OTG_DIEPINT_XFRC);
+	}
+}
+
+static void oepint_handler()
+{
+	// Find the endpoint caused the interrupt
+	uint8_t endpoint_number = ffs(USB_OTG_HS_DEVICE->DAINT >> 16) - 1;
+
+	if (OUT_ENDPOINT(endpoint_number)->DOEPINT & USB_OTG_DOEPINT_XFRC) {
+		usb_events.on_out_transfer_completed(endpoint_number);
+		// Clear the interrupt flag
+		SET_BIT(OUT_ENDPOINT(endpoint_number)->DOEPINT, USB_OTG_DOEPINT_XFRC);
+	}
+}
+
 /**
- * Handle the USB core interrupts
+ * Handle the USB core interrupts (poll)
  */
 static void gintsts_handler()
 {
@@ -390,20 +428,28 @@ static void gintsts_handler()
 		rxflvl_handler();
 		SET_BIT(USB_OTG_HS_GLOBAL->GINTSTS, USB_OTG_GINTSTS_RXFLVL);
 	} else if (gintsts & USB_OTG_GINTSTS_IEPINT) {
-
+		iepint_handler();
+		// Clear the interrupt
+		SET_BIT(USB_OTG_HS_GLOBAL->GINTSTS, USB_OTG_GINTSTS_IEPINT);
 	} else if (gintsts & USB_OTG_GINTSTS_OEPINT) {
-
+		oepint_handler();
+		// Clear the interrupt
+		SET_BIT(USB_OTG_HS_GLOBAL->GINTSTS, USB_OTG_GINTSTS_OEPINT);
 	}
+
+	usb_events.on_usb_polled();
 }
 
 const UsbDriver usb_driver = {
 	.initialize_core = &initialize_core,
 	.initialize_gpio_pins = &initialize_gpio_pins,
+	.set_device_address = &set_device_address,
 	.connect = &connect,
 	.disconnect = &disconnect,
 	.flush_rxfifo = &flush_rxfifo,
 	.flush_txfifo = &flush_txfifo,
 	.configure_in_endpoint = &configure_in_endpoint,
 	.read_packet = &read_packet,
-	.write_packet = &write_packet
+	.write_packet = &write_packet,
+	.poll = &gintsts_handler
 };
